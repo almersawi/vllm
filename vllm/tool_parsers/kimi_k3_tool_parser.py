@@ -33,6 +33,7 @@ a value that literally contains ``<|close|>argument<|sep|>`` or
 
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import regex as re
 from openai.types.responses import ToolChoiceCustom, ToolChoiceFunction
@@ -52,6 +53,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.renderers.chat_utils import make_tool_call_id
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
 
@@ -67,6 +69,34 @@ def _partial_tag_overlap(text: str, tag: str) -> int:
         if text.endswith(tag[:n]):
             return n
     return 0
+
+
+def _decode_value(arg_type: str, raw_value: str) -> object:
+    if arg_type == "string":
+        return raw_value
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return raw_value
+
+
+def _json_string_contents(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)[1:-1]
+
+
+@dataclass
+class _StreamingCall:
+    """An open ``call`` block whose arguments are being streamed."""
+
+    index: int
+    # A call without a tool name is consumed silently, as in ``_decode_call``.
+    dropped: bool
+    args_emitted: bool = False
+    # ``None`` between argument blocks, else the open argument's type.
+    arg_type: str | None = None
+    arg_key: str = ""
+    # Start of a non-string value, buffered until its argument block closes.
+    value_start: int = 0
 
 
 class KimiK3ToolParser(ToolParser):
@@ -133,13 +163,42 @@ class KimiK3ToolParser(ToolParser):
             _O + r"\s*response\s*" + _S + r"(?P<c>.*?)" + _C + r"\s*response\s*" + _S,
             re.DOTALL,
         )
-        self._call_close_re = re.compile(_C + r"\s*call\s*" + _S)
+        # Streaming scans with half-open markers so a call or argument is seen
+        # as soon as its opener lands, before its close marker exists.
+        self._call_open_re = re.compile(
+            _O + r"\s*call\s+(?P<attrs>" + _TEXT_UNTIL_SEP + r")" + _S
+        )
+        self._call_body_event_re = re.compile(
+            r"(?P<arg>"
+            + _O
+            + r"\s*argument\s+(?P<attrs>"
+            + _TEXT_UNTIL_SEP
+            + r")"
+            + _S
+            + r")|(?P<call_close>"
+            + _C
+            + r"\s*call\s*"
+            + _S
+            + r")"
+        )
+        self._value_end_re = re.compile(
+            r"(?P<arg_close>"
+            + _C
+            + r"\s*argument\s*"
+            + _S
+            + r")|(?P<call_close>"
+            + _C
+            + r"\s*call\s*"
+            + _S
+            + r")"
+        )
 
         # streaming state
         self._sent_content_idx = 0
         self._sent_tool_call_count = 0
-        self._stream_call_close_idx = 0
-        self._stream_call_parse_idx = 0
+        # Everything in current_text before this index has been consumed.
+        self._stream_idx = 0
+        self._stream_call: _StreamingCall | None = None
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -230,14 +289,7 @@ class KimiK3ToolParser(ToolParser):
             arg_attrs = self._attrs(arg_match["attrs"])
             key = arg_attrs.get("key", "")
             arg_type = arg_attrs.get("type", "string")
-            raw_value = arg_match["val"]
-            if arg_type == "string":
-                arguments[key] = raw_value
-            else:
-                try:
-                    arguments[key] = json.loads(raw_value)
-                except json.JSONDecodeError:
-                    arguments[key] = raw_value
+            arguments[key] = _decode_value(arg_type, arg_match["val"])
         if not tool_name:
             return None
         return ToolCall(
@@ -281,8 +333,6 @@ class KimiK3ToolParser(ToolParser):
         #   <|open|> / response / <|sep|>Hi     -> emit only "Hi" after open closes
         #   Hi<|open|> / tools / <|sep|>...     -> emit "Hi", hold the tools marker
         #   Hi<|close|> / response / <|sep|>... -> emit "Hi", hold the close marker
-        # Tool calls are even simpler: they are not emitted until a full
-        # <|close|>call<|sep|> is present in current_text.
         m_open = self._response_open_re.search(current_text)
         # In the normal chat path, the response-open marker may be consumed as
         # the generation prefix. Then generated text starts directly with the
@@ -373,38 +423,119 @@ class KimiK3ToolParser(ToolParser):
         if m_tools is None:
             return DeltaMessage(content=content) if content else None
 
-        self._stream_call_parse_idx = max(self._stream_call_parse_idx, m_tools.end())
-        self._stream_call_close_idx = max(self._stream_call_close_idx, m_tools.end())
-        new_calls: list[ToolCall] = []
-        while True:
-            m_close = self._call_close_re.search(
-                current_text, self._stream_call_close_idx, partial=True
-            )
-            if m_close.partial:
-                self._stream_call_close_idx = m_close.start()
-                break
-            self._stream_call_close_idx = m_close.end()
-            for call_match in self._call_re.finditer(
-                current_text, self._stream_call_parse_idx, m_close.end()
-            ):
-                tool_call = self._decode_call(call_match["attrs"], call_match["body"])
-                if tool_call is not None:
-                    new_calls.append(tool_call)
-                self._stream_call_parse_idx = call_match.end()
+        self._stream_idx = max(self._stream_idx, m_tools.end())
+        deltas: list[DeltaToolCall] = []
+        while self._stream_tool_call_event(current_text, deltas):
+            pass
 
-        if not new_calls:
+        if not deltas:
             return DeltaMessage(content=content) if content else None
-
-        deltas = [
-            DeltaToolCall(
-                index=self._sent_tool_call_count + i,
-                id=tc.id,
-                type="function",
-                function=DeltaFunctionCall(
-                    name=tc.function.name, arguments=tc.function.arguments
-                ).model_dump(exclude_none=True),
-            )
-            for i, tc in enumerate(new_calls)
-        ]
-        self._sent_tool_call_count += len(new_calls)
         return DeltaMessage(content=content, tool_calls=deltas)
+
+    def _stream_tool_call_event(self, text: str, deltas: list[DeltaToolCall]) -> bool:
+        """Consume the next complete XTML event at ``self._stream_idx``.
+
+        The name goes out when the call opens, string values stream as they
+        arrive (minus a trailing partial close marker), and other values are
+        held until their argument block closes, since a partial literal cannot
+        be decoded. The concatenated fragments match ``extract_tool_calls``.
+
+        Returns:
+            Whether an event was consumed; ``False`` once the text runs out.
+
+        """
+        call = self._stream_call
+        if call is None:
+            m = self._call_open_re.search(text, self._stream_idx, partial=True)
+            if not self._advance(text, m):
+                return False
+            name = self._attrs(m["attrs"]).get("tool", "")
+            call = _StreamingCall(index=self._sent_tool_call_count, dropped=not name)
+            self._stream_call = call
+            if name:
+                self._sent_tool_call_count += 1
+                deltas.append(
+                    DeltaToolCall(
+                        index=call.index,
+                        id=make_tool_call_id(),
+                        type="function",
+                        function=DeltaFunctionCall(name=name),
+                    )
+                )
+            return True
+
+        if call.arg_type is None:
+            m = self._call_body_event_re.search(text, self._stream_idx, partial=True)
+            if not self._advance(text, m):
+                return False
+            if m["call_close"] is not None:
+                self._end_stream_call(deltas)
+                return True
+            arg_attrs = self._attrs(m["attrs"])
+            call.arg_key = arg_attrs.get("key", "")
+            call.arg_type = arg_attrs.get("type", "string")
+            call.value_start = m.end()
+            if call.arg_type == "string":
+                self._emit_arguments(deltas, self._argument_prefix(call) + '"')
+            return True
+
+        m = self._value_end_re.search(text, self._stream_idx, partial=True)
+        value_end = len(text) if m is None else m.start()
+        if call.arg_type == "string":
+            chunk = text[self._stream_idx : value_end]
+            self._emit_arguments(deltas, _json_string_contents(chunk))
+        self._stream_idx = value_end
+        if m is None or m.partial:
+            return False
+
+        self._stream_idx = m.end()
+        if call.arg_type == "string":
+            self._emit_arguments(deltas, '"')
+        elif m["arg_close"] is not None:
+            value = _decode_value(call.arg_type, text[call.value_start : m.start()])
+            self._emit_arguments(
+                deltas,
+                self._argument_prefix(call) + json.dumps(value, ensure_ascii=False),
+            )
+        # else: like ``_arg_re``, drop a non-string value cut off by the call
+        # close. A string value cut off this way was already streamed.
+        call.arg_type = None
+        if m["call_close"] is not None:
+            self._end_stream_call(deltas)
+        return True
+
+    def _advance(self, text: str, m: re.Match | None) -> bool:
+        """Move past a complete match, or up to a partial one at the end."""
+        if m is None:
+            self._stream_idx = len(text)
+            return False
+        if m.partial:
+            self._stream_idx = m.start()
+            return False
+        self._stream_idx = m.end()
+        return True
+
+    def _argument_prefix(self, call: _StreamingCall) -> str:
+        separator = ", " if call.args_emitted else "{"
+        call.args_emitted = True
+        return f"{separator}{json.dumps(call.arg_key, ensure_ascii=False)}: "
+
+    def _end_stream_call(self, deltas: list[DeltaToolCall]) -> None:
+        assert self._stream_call is not None
+        self._emit_arguments(deltas, "}" if self._stream_call.args_emitted else "{}")
+        self._stream_call = None
+
+    def _emit_arguments(self, deltas: list[DeltaToolCall], fragment: str) -> None:
+        call = self._stream_call
+        if call is None or call.dropped or not fragment:
+            return
+        last = deltas[-1] if deltas else None
+        if last is not None and last.index == call.index and last.function:
+            last.function.arguments = (last.function.arguments or "") + fragment
+        else:
+            deltas.append(
+                DeltaToolCall(
+                    index=call.index,
+                    function=DeltaFunctionCall(arguments=fragment),
+                )
+            )
